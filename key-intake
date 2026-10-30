@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Opens the key-intake window (a small app with its own Dock icon) for NAME[=label] … --url <link> --steps "<…>" and prints one status line per name (stored|skipped|failed). Values never appear here.
+set -euo pipefail
+trap 'exit 2' ERR
+
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+	link="$(readlink "$self")"
+	case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$self")" && pwd)"
+SRC="${KEY_INTAKE_SRC:-$HERE/app/KeyIntake.swift}"
+BIN_DIR="${KEY_INTAKE_BIN_DIR:-$HOME/.local/share/key-intake}"
+ICON_SRC="${KEY_INTAKE_ICON_SRC:-$HERE/app/MakeIcon.swift}"
+PLIST_SRC="${KEY_INTAKE_PLIST_SRC:-$HERE/app/Info.plist}"
+ON_STORE="${KEY_INTAKE_ON_STORE:-}"
+APP="$BIN_DIR/KeyIntake.app"
+BIN="$APP/Contents/MacOS/KeyIntake"
+
+usage() {
+	cat <<'EOF'
+usage: key-intake NAME[=label] … --url <link> --steps "<step> | <step> | …" [NAME[=label] … --url … --steps …]
+Opens a window in which you paste one value per NAME into the login keychain.
+Every group of NAMEs ends with --url and --steps; names from the same page (Access Key ID + Secret) share one group.
+  --url    https link to the exact page where the key is created. The window opens it at start.
+  --steps  what to do there, separated by |: token type, permissions, scope (which resources), lifetime,
+           what to copy. At most 12 steps. The window numbers them.
+  label    the value shown on that page that belongs in this row, e.g. "Access Key ID".
+Example:
+  key-intake R2_ACCESS_KEY_ID="Access Key ID" R2_SECRET_ACCESS_KEY="Secret Access Key" \
+    --url "https://dash.cloudflare.com/?to=/:account/r2/api-tokens" \
+    --steps "Create Account API Token | Permissions: Object Read & Write | Buckets: only my-bucket | TTL: Forever | Create, then copy both values"
+Prints one line per name: stored NAME · skipped NAME · failed NAME <reason>. Values never appear.
+exit: 0 something stored · 1 cancelled / nothing stored · 2 error
+NAME: letter or digit first, then letters, digits, _ . - (at most 128). label: plain text, at most 200 characters.
+Read a value back: security find-generic-password -s NAME -w
+Environment:
+  KEY_INTAKE_ACCOUNT   account for new entries (default: your user name); existing entries keep theirs
+  KEY_INTAKE_BROWSER   app that opens the page, e.g. "Firefox" (default: your default browser)
+  KEY_INTAKE_LANG      window language, en or de (default: from your system languages)
+  KEY_INTAKE_ON_STORE  executable started in the background after at least one value was stored
+  KEY_INTAKE_SNAPSHOT  render the window into this PNG and exit (docs; stores nothing)
+EOF
+}
+
+[ "$#" -gt 0 ] || { usage >&2; exit 2; }
+
+for arg in "$@"; do
+	case "$arg" in -h | --help) usage; exit 0 ;; esac
+done
+
+guide_error() { printf '%s\n\n' "$1" >&2; usage >&2; exit 2; }
+url_re='^https://[^[:space:]/?#]+([/?#][^[:space:]]*)?$' step_re='[^[:space:]|]'
+check_args() {
+	local pending=0 url="" steps="" arg
+	while [ "$#" -gt 0 ]; do
+		arg="$1"; shift
+		case "$arg" in
+			--keychain) [ "$#" -gt 0 ] && shift ;;
+			--stdin-values) ;;
+			--url | --steps)
+				[ "$#" -gt 0 ] && [[ "$1" != --* ]] || guide_error "$arg needs a value"
+				if [ "$pending" -eq 0 ] || { [ "$arg" = --url ] && [ -n "$url" ]; } || { [ "$arg" = --steps ] && [ -n "$steps" ]; }; then
+					guide_error "--url and --steps follow the names they belong to"
+				fi
+				if [ "$arg" = --url ]; then
+					[[ "$1" =~ $url_re ]] || guide_error "invalid url"
+					url="$1"
+				else
+					[[ "$1" =~ $step_re ]] || guide_error "--steps needs at least one step"
+					steps="$1"
+				fi
+				shift ;;
+			*)
+				[[ "${arg%%=*}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid name" >&2; exit 2; }
+				if [ -n "$url" ] && [ -n "$steps" ]; then pending=0 url="" steps=""
+				elif [ -n "$url$steps" ]; then guide_error "every NAME needs --url and --steps"; fi
+				pending=$((pending + 1)) ;;
+		esac
+	done
+	[ "$pending" -gt 0 ] && [ -n "$url" ] && [ -n "$steps" ] || guide_error "every NAME needs --url and --steps"
+}
+check_args "$@"
+
+want="$(cat "$SRC" "$ICON_SRC" "$PLIST_SRC" | /usr/bin/shasum -a 256 | cut -c1-64)"
+have="$(cat "$BIN_DIR/.source-hash" 2>/dev/null || true)"
+if [ ! -x "$BIN" ] || [ "$want" != "$have" ]; then
+	command -v swiftc >/dev/null || { echo "swiftc not found: install the Xcode Command Line Tools (xcode-select --install)" >&2; exit 2; }
+	mkdir -p "$BIN_DIR"
+	work="$(mktemp -d "$BIN_DIR/build.XXXXXX")"
+	trap 'rm -rf "$work"' EXIT
+	fresh="$work/KeyIntake.app"
+	mkdir -p "$fresh/Contents/MacOS" "$fresh/Contents/Resources"
+	if ! log="$(swiftc -O -suppress-warnings "$SRC" -o "$fresh/Contents/MacOS/KeyIntake" 2>&1)"; then
+		printf '%s\n' "$log" >&2
+		exit 2
+	fi
+	if ! log="$(swiftc -O -suppress-warnings "$ICON_SRC" -o "$work/makeicon" 2>&1 \
+		&& "$work/makeicon" "$work/KeyIntake.iconset" 2>&1 \
+		&& /usr/bin/iconutil -c icns -o "$fresh/Contents/Resources/KeyIntake.icns" "$work/KeyIntake.iconset" 2>&1)"; then
+		printf '%s\n' "$log" >&2
+		exit 2
+	fi
+	cp "$PLIST_SRC" "$fresh/Contents/Info.plist"
+	/usr/bin/codesign --force --sign - "$fresh" >/dev/null 2>&1 || true
+	rm -rf "$APP" "$BIN_DIR/KeyIntake"
+	mv "$fresh" "$APP"
+	printf '%s' "$want" >"$BIN_DIR/.source-hash"
+	rm -rf "$work"
+	trap - EXIT
+fi
+
+rc=0
+out="$("$BIN" "$@")" || rc=$?
+[ -n "$out" ] && printf '%s\n' "$out"
+
+if [ -n "$ON_STORE" ] && /usr/bin/grep -q '^stored ' <<<"$out"; then
+	(nohup "$ON_STORE" >/dev/null 2>&1 &)
+fi
+exit "$rc"
