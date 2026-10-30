@@ -9,7 +9,7 @@ Built for working with coding agents: the agent needs a token, but it should nev
 ## Requirements
 
 - macOS 12 or later
-- Xcode Command Line Tools (`xcode-select --install`) — the app is compiled from source on first run
+- Swift compiler (`swiftc`) from the Xcode Command Line Tools (`xcode-select --install`) — the app is compiled from source on first run; no other dependencies
 
 ## Install
 
@@ -31,12 +31,21 @@ key-intake R2_ACCESS_KEY_ID="Access Key ID" R2_SECRET_ACCESS_KEY="Secret Access 
 - `NAME` becomes the keychain service name. The optional `="label"` tells the person which value on the page belongs in this row.
 - Every group of names ends with `--url` (the exact https page where the key is created) and `--steps` (what to do there, separated by `|`, at most 12). Names from the same page share one group; one call can hold several groups.
 - The window opens the first page at start and stays on top beside the browser.
+- The window has no timeout: it waits until the person saves or cancels (Cancel, Esc or Cmd+Q).
 - Output, one line per name: `stored NAME`, `skipped NAME` or `failed NAME <reason>`.
-- Exit code: `0` at least one value stored · `1` cancelled or nothing stored · `2` error.
+- Exit code: `0` at least one value stored · `1` cancelled or nothing stored · `2` error (bad arguments, build failure, or any `failed` line).
 
 An agent should start it in the background: the window waits for the person.
 
 If a name already exists, the row says so and only overwrites after the person ticks "replace". If a name exists more than once, the row is locked until the duplicates are cleaned up.
+
+### Where the value lands and how to read it
+
+Each value becomes a generic password item in the login keychain: service = `NAME`, account = `KEY_INTAKE_ACCOUNT` (default: your user name). Read it back inline, at the moment a command needs it, and never echo it:
+
+```bash
+curl -H "Authorization: Bearer $(security find-generic-password -s NAME -w)" https://api.example.com/
+```
 
 ### Environment
 
@@ -49,6 +58,14 @@ If a name already exists, the row says so and only overwrites after the person t
 | `KEY_INTAKE_BIN_DIR` | where the app is built | `~/.local/share/key-intake` |
 | `KEY_INTAKE_SNAPSHOT` | render the window into this PNG and exit — nothing is stored, no page opens (used for the screenshot above) | none |
 
+## Agent skill
+
+`skills/key-intake/SKILL.md` teaches a coding agent (Claude Code skill format) when and how to call `key-intake`: never ask for a secret in chat, start the window in the background with the page URL and numbered steps, read the value back inline. Install it by copying or symlinking the folder:
+
+```bash
+ln -s "$PWD/key-intake/skills/key-intake" ~/.claude/skills/key-intake
+```
+
 ## Security model
 
 - **The value only goes into the keychain.** It travels from the secure text field over a pipe into `/usr/bin/security -i`, hex-encoded. It never appears in `argv` (so not in `ps` or shell history), never on stdout or stderr, never in a file.
@@ -59,6 +76,13 @@ If a name already exists, the row says so and only overwrites after the person t
 - **Test mode cannot touch your login keychain.** `--keychain <absolute path> --stdin-values` reads values from stdin into a throwaway keychain; it refuses the login keychain by path, symlink and inode.
 
 What it does not protect against: anything that can already read your login keychain or your screen.
+
+## Limitations
+
+- macOS only; needs a logged-in graphical session (it opens a window), so it does not work over plain SSH or in CI.
+- The app is ad-hoc signed and built locally, not notarized. macOS 12 is the declared minimum (`LSMinimumSystemVersion`); newer versions are what the author runs.
+- Values are stored by `/usr/bin/security`, so any process that runs `security find-generic-password -s NAME -w` as you can read them back — that is by design (agents need to).
+- Values are trimmed of surrounding whitespace before storing; a name can hold one value.
 
 ## Tests
 
